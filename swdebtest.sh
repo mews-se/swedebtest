@@ -4,7 +4,7 @@ set -euo pipefail
 export LC_ALL=C
 export LANG=C
 
-ARCH="amd64"
+ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 SUITE="stable"
 RUNS=3
 PING_COUNT=4
@@ -23,148 +23,468 @@ MIRRORS=(
   "debian.mirror.su.se"
 )
 
+usage() {
+  cat <<EOF
+Usage: $0 [--suite stable] [--arch amd64] [--runs 3]
+
+Examples:
+  $0
+  $0 --suite bookworm
+  $0 --arch arm64 --runs 5
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --suite) SUITE="${2:-}"; shift 2 ;;
-    --arch) ARCH="${2:-}"; shift 2 ;;
-    --runs) RUNS="${2:-}"; shift 2 ;;
-    *) echo "Unknown parameter: $1"; exit 1 ;;
+    --suite)
+      SUITE="${2:-}"
+      shift 2
+      ;;
+    --arch)
+      ARCH="${2:-}"
+      shift 2
+      ;;
+    --runs)
+      RUNS="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown parameter: $1" >&2
+      exit 1
+      ;;
   esac
 done
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing command: $1" >&2
+    exit 1
+  }
+}
+
+for cmd in curl awk sed grep sort timeout mktemp wc head tail cut tr dpkg; do
+  require_cmd "$cmd"
+done
+
+if ! command -v ping >/dev/null 2>&1; then
+  echo "Warning: ping not found, ping tests will be skipped." >&2
+fi
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-is_number() { [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+is_number() {
+  [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
 
-format_float() { awk -v x="${1:-0}" 'BEGIN { printf "%.0f", x }'; }
-format_ms() { awk -v x="${1:-0}" 'BEGIN { printf "%.1f ms", x }'; }
-format_s() { awk -v x="${1:-0}" 'BEGIN { printf "%.3f s", x }'; }
+format_score() {
+  local x="${1:-}"
+  x="${x//$'\r'/}"
+  x="${x/,/.}"
+  if ! is_number "$x"; then
+    printf "N/A"
+    return
+  fi
+  awk -v x="$x" 'BEGIN { printf "%.0f", x }'
+}
+
+format_ms() {
+  local x="${1:-}"
+  x="${x/,/.}"
+  if ! is_number "$x"; then
+    printf "N/A"
+    return
+  fi
+  awk -v x="$x" 'BEGIN { printf "%.1f ms", x }'
+}
+
+format_s() {
+  local x="${1:-}"
+  x="${x/,/.}"
+  if ! is_number "$x"; then
+    printf "N/A"
+    return
+  fi
+  awk -v x="$x" 'BEGIN { printf "%.3f s", x }'
+}
 
 human_speed() {
-  awk -v b="${1:-0}" 'BEGIN {
+  local b="${1:-}"
+  b="${b/,/.}"
+  if ! is_number "$b"; then
+    printf "N/A"
+    return
+  fi
+  awk -v b="$b" 'BEGIN {
     split("B/s KiB/s MiB/s GiB/s", u, " ");
     i=1;
-    while (b >= 1024 && i < 4) { b/=1024; i++ }
+    while (b >= 1024 && i < 4) {
+      b /= 1024;
+      i++
+    }
     printf "%.2f %s", b, u[i];
   }'
 }
 
-median() {
-  sort -n "$1" | awk '
-  { a[NR]=$1 }
-  END {
-    if (NR==0) { print "NA"; exit }
-    if (NR%2) print a[(NR+1)/2]
-    else printf "%.6f\n", (a[NR/2]+a[NR/2+1])/2
-  }'
+median_of_file() {
+  local file="$1"
+
+  if [[ ! -s "$file" ]]; then
+    echo "NA"
+    return
+  fi
+
+  local sorted_file count
+  sorted_file="$(mktemp "${TMPDIR}/median.XXXXXX")"
+
+  grep -E '^[0-9]+([.][0-9]+)?$' "$file" | sort -n > "$sorted_file" || true
+  count="$(wc -l < "$sorted_file" | tr -d '[:space:]')"
+
+  if [[ -z "$count" || "$count" -eq 0 ]]; then
+    rm -f "$sorted_file"
+    echo "NA"
+    return
+  fi
+
+  if (( count % 2 == 1 )); then
+    sed -n "$(( (count + 1) / 2 ))p" "$sorted_file"
+  else
+    local mid1 mid2 v1 v2
+    mid1=$(( count / 2 ))
+    mid2=$(( mid1 + 1 ))
+    v1="$(sed -n "${mid1}p" "$sorted_file")"
+    v2="$(sed -n "${mid2}p" "$sorted_file")"
+    awk -v a="$v1" -v b="$v2" 'BEGIN { printf "%.6f\n", (a + b) / 2 }'
+  fi
+
+  rm -f "$sorted_file"
 }
 
-ping_avg() {
-  ping -c "$PING_COUNT" -n "$1" 2>/dev/null \
-  | awk -F'=' '/min\/avg/ {split($2,a,"/"); print a[2]}'
+pick_scheme() {
+  local host="$1"
+  local path="$2"
+
+  if curl -L -o /dev/null -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 \
+    "https://${host}${path}" >/dev/null 2>&1; then
+    printf "https"
+    return 0
+  fi
+
+  if curl -L -o /dev/null -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 \
+    "http://${host}${path}" >/dev/null 2>&1; then
+    printf "http"
+    return 0
+  fi
+
+  return 1
 }
 
-curl_test() {
-  curl -L -o /dev/null -sS \
-    --connect-timeout "$CONNECT_TIMEOUT" \
-    --max-time "$MAX_TIME" \
-    -w '%{time_starttransfer}\t%{time_total}\t%{speed_download}\t%{http_code}\n' \
-    "$1" 2>/dev/null || echo -e "NA\tNA\tNA\t000"
+pick_large_file() {
+  local base="$1"
+
+  local candidates=(
+    "${base}/dists/${SUITE}/main/Contents-${ARCH}.gz"
+    "${base}/dists/${SUITE}/Contents-all.gz"
+    "${base}/dists/${SUITE}/main/binary-${ARCH}/Packages.xz"
+    "${base}/dists/${SUITE}/main/binary-${ARCH}/Packages.gz"
+  )
+
+  local url
+  for url in "${candidates[@]}"; do
+    if curl -L -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 -I "$url" 2>/dev/null \
+      | grep -qE '^HTTP/[0-9.]+ 200'; then
+      printf "%s\n" "$url"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
-score() {
-  awk -v p="$1" -v t="$2" -v s="$3" '
-  BEGIN {
-    score=0
-    if (p!="NA") score += (100-p)*2
-    if (t!="NA") score += (1/t)*50
-    if (s!="NA") score += s/1000000
-    printf "%.0f\n", score
-  }'
+pick_small_file() {
+  local base="$1"
+
+  local candidates=(
+    "${base}/dists/${SUITE}/main/binary-${ARCH}/Packages.gz"
+    "${base}/dists/${SUITE}/main/binary-${ARCH}/Packages.xz"
+    "${base}/dists/${SUITE}/Release"
+  )
+
+  local url
+  for url in "${candidates[@]}"; do
+    if curl -L -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 -I "$url" 2>/dev/null \
+      | grep -qE '^HTTP/[0-9.]+ 200'; then
+      printf "%s\n" "$url"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
-is_swedish() {
+ping_stats() {
+  local host="$1"
+
+  if ! command -v ping >/dev/null 2>&1; then
+    echo "NA NA"
+    return
+  fi
+
+  local out loss avg
+  if ! out="$(timeout 10 ping -c "$PING_COUNT" -n "$host" 2>/dev/null)"; then
+    echo "NA NA"
+    return
+  fi
+
+  loss="$(printf '%s\n' "$out" | awk -F', ' '/packet loss/ {gsub(/% packet loss/,"",$3); print $3; exit}')"
+  avg="$(printf '%s\n' "$out" | awk -F'=' '/min\/avg\/max/ {gsub(/ ms/, "", $2); split($2, a, "/"); print a[2]; exit}')"
+
+  echo "${loss:-NA} ${avg:-NA}"
+}
+
+curl_timing() {
+  local url="$1"
+  local out
+
+  out="$(
+    curl -L -o /dev/null -sS \
+      --connect-timeout "$CONNECT_TIMEOUT" \
+      --max-time "$MAX_TIME" \
+      -w '%{time_starttransfer}\t%{time_total}\t%{speed_download}\t%{http_code}\n' \
+      "$url" 2>/dev/null
+  )" || {
+    printf 'NA\tNA\tNA\t000\n'
+    return
+  }
+
+  printf '%s\n' "${out//$'\r'/}"
+}
+
+score_mirror() {
+  local loss="${1:-NA}"
+  local avg_ping="${2:-NA}"
+  local ttfb="${3:-NA}"
+  local total="${4:-NA}"
+  local speed="${5:-NA}"
+  local ok="${6:-0}"
+  local scheme="${7:-http}"
+
+  loss="${loss/,/.}"
+  avg_ping="${avg_ping/,/.}"
+  ttfb="${ttfb/,/.}"
+  total="${total/,/.}"
+  speed="${speed/,/.}"
+
+  awk -v loss="$loss" -v ping="$avg_ping" -v ttfb="$ttfb" -v total="$total" -v speed="$speed" -v ok="$ok" -v scheme="$scheme" '
+    function isnum(x) { return (x ~ /^[0-9]+([.][0-9]+)?$/) }
+    BEGIN {
+      if (ok != 1) {
+        print "0"
+        exit
+      }
+
+      score = 0
+
+      if (isnum(loss)) score += (100 - loss) * 2
+      else score += 60
+
+      if (isnum(ping)) {
+        if (ping < 3) score += 80
+        else if (ping < 5) score += 70
+        else if (ping < 10) score += 55
+        else if (ping < 20) score += 40
+        else score += 15
+      } else {
+        score += 20
+      }
+
+      if (isnum(ttfb)) {
+        if (ttfb < 0.02) score += 110
+        else if (ttfb < 0.05) score += 95
+        else if (ttfb < 0.10) score += 75
+        else if (ttfb < 0.20) score += 50
+        else score += 15
+      }
+
+      if (isnum(total)) {
+        if (total < 0.20) score += 90
+        else if (total < 0.35) score += 75
+        else if (total < 0.60) score += 55
+        else if (total < 1.00) score += 35
+        else if (total < 2.00) score += 15
+        else score += 5
+      }
+
+      if (isnum(speed)) {
+        if (speed > 120000000) score += 260
+        else if (speed > 90000000) score += 230
+        else if (speed > 70000000) score += 205
+        else if (speed > 50000000) score += 175
+        else if (speed > 30000000) score += 135
+        else if (speed > 15000000) score += 90
+        else if (speed > 5000000) score += 45
+        else if (speed > 1000000) score += 20
+        else score += 5
+      }
+
+      if (scheme == "https") score += 5
+
+      printf "%.2f\n", score
+    }'
+}
+
+is_swedish_mirror() {
   case "$1" in
     ftp.se.debian.org|ftp.acc.umu.se|debian.lth.se|mirrors.glesys.net|mirror.zetup.net|ftpmirror1.infania.net|mirror.braindrainlan.nu|debian.mirror.su.se)
-      return 0 ;;
-    *) return 1 ;;
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
   esac
 }
 
-RESULTS="$TMPDIR/results"
-: > "$RESULTS"
+measure_mirror() {
+  local host="$1"
+  local result_dir="$TMPDIR/$host"
+  mkdir -p "$result_dir"
 
-echo "Testing mirrors..." >&2
+  local scheme base small_url large_url
+  if ! scheme="$(pick_scheme "$host" "/debian/dists/${SUITE}/Release")"; then
+    printf '0\t%s\tNA\tNA\tNA\tNA\tNA\tNA\n' "$host"
+    return
+  fi
 
-for host in "${MIRRORS[@]}"; do
-  echo "Testing $host..." >&2
+  base="${scheme}://${host}/debian"
 
-  base="https://${host}/debian"
-  small="$base/dists/${SUITE}/main/binary-${ARCH}/Packages.gz"
-  large="$base/dists/${SUITE}/main/Contents-${ARCH}.gz"
+  if ! small_url="$(pick_small_file "$base")"; then
+    printf '0\t%s\tNA\tNA\tNA\tNA\tNA\t%s\n' "$host" "$base"
+    return
+  fi
 
-  ping="$(ping_avg "$host" || echo NA)"
+  if ! large_url="$(pick_large_file "$base")"; then
+    printf '0\t%s\tNA\tNA\tNA\tNA\tNA\t%s\n' "$host" "$base"
+    return
+  fi
 
-  for i in $(seq 1 $RUNS); do
-    curl_test "$small" >> "$TMPDIR/small"
-    curl_test "$large" >> "$TMPDIR/large"
+  local loss pavg
+  read -r loss pavg < <(ping_stats "$host")
+
+  local i
+  for ((i=1; i<=RUNS; i++)); do
+    curl_timing "$small_url" > "$result_dir/small_$i.txt"
+    curl_timing "$large_url" > "$result_dir/large_$i.txt"
   done
 
-  ttfb=$(awk '{print $1}' "$TMPDIR/small" | median /dev/stdin)
-  total=$(awk '{print $2}' "$TMPDIR/large" | median /dev/stdin)
-  speed=$(awk '{print $3}' "$TMPDIR/large" | median /dev/stdin)
+  : > "$result_dir/ttfb.txt"
+  : > "$result_dir/total.txt"
+  : > "$result_dir/speed.txt"
 
-  sc=$(score "$ping" "$ttfb" "$speed")
+  local f
+  for f in "$result_dir"/small_*.txt; do
+    [[ -f "$f" ]] || continue
+    awk -F'\t' '$1 ~ /^[0-9.]+$/ {print $1}' "$f" >> "$result_dir/ttfb.txt"
+  done
 
-  echo -e "$sc\t$host\t$ping\t$ttfb\t$speed\t$base" >> "$RESULTS"
+  for f in "$result_dir"/large_*.txt; do
+    [[ -f "$f" ]] || continue
+    awk -F'\t' '$2 ~ /^[0-9.]+$/ {print $2}' "$f" >> "$result_dir/total.txt"
+    awk -F'\t' '$3 ~ /^[0-9.]+$/ {print $3}' "$f" >> "$result_dir/speed.txt"
+  done
 
-  : > "$TMPDIR/small" "$TMPDIR/large"
+  local mttfb mtotal mspeed
+  mttfb="$(median_of_file "$result_dir/ttfb.txt")"
+  mtotal="$(median_of_file "$result_dir/total.txt")"
+  mspeed="$(median_of_file "$result_dir/speed.txt")"
+
+  local http_small http_large
+  http_small="$(tail -n1 "$result_dir/small_1.txt" | awk -F'\t' '{print $4}')"
+  http_large="$(tail -n1 "$result_dir/large_1.txt" | awk -F'\t' '{print $4}')"
+
+  local ok=0
+  if [[ "$http_small" == "200" && "$http_large" == "200" ]]; then
+    ok=1
+  fi
+
+  local score
+  score="$(score_mirror "$loss" "$pavg" "$mttfb" "$mtotal" "$mspeed" "$ok" "$scheme")"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$score" \
+    "$host" \
+    "$loss" \
+    "$pavg" \
+    "$mttfb" \
+    "$mtotal" \
+    "$mspeed" \
+    "$base"
+}
+
+RESULTS="$TMPDIR/results.tsv"
+: > "$RESULTS"
+
+echo "Testing Debian mirrors for suite=${SUITE}, arch=${ARCH}, runs=${RUNS}..." >&2
+echo "TTFB is measured with a smaller file, throughput with a larger file." >&2
+echo >&2
+
+for host in "${MIRRORS[@]}"; do
+  echo "Testing $host ..." >&2
+  measure_mirror "$host" >> "$RESULTS"
 done
 
-sort -nr "$RESULTS" > "$TMPDIR/sorted"
+SORTED="$TMPDIR/sorted.tsv"
+sort -t$'\t' -k1,1nr -k7,7nr -k5,5n "$RESULTS" > "$SORTED"
 
 echo
-printf "%-4s %-6s %-30s %-10s %-10s %-15s\n" "RANK" "SCORE" "HOST" "PING" "TTFB" "SPEED"
-echo "-----------------------------------------------------------------------"
+printf "%-4s %-6s %-31s %-10s %-10s %-15s\n" \
+  "RANK" "SCORE" "HOST" "PING" "TTFB" "SPEED"
+printf "%s\n" "--------------------------------------------------------------------------------"
 
 rank=1
-while read -r line; do
-  host=$(echo "$line" | cut -f2)
-  ping=$(echo "$line" | cut -f3)
-  ttfb=$(echo "$line" | cut -f4)
-  speed=$(echo "$line" | cut -f5)
-
+while IFS=$'\t' read -r score host loss avg ttfb total speed base; do
   marker=""
-  [[ $rank -eq 1 ]] && marker="<<< BEST"
+  [[ "$rank" -eq 1 ]] && marker=" <<< BEST"
 
-  printf "%-4s %-6s %-30s %-10s %-10s %-15s %s\n" \
+  printf "%-4s %-6s %-31s %-10s %-10s %-15s%s\n" \
     "$rank" \
-    "$(format_float "$(echo "$line" | cut -f1)")" \
+    "$(format_score "$score")" \
     "$host" \
-    "$(format_ms "$ping")" \
+    "$(format_ms "$avg")" \
     "$(format_s "$ttfb")" \
     "$(human_speed "$speed")" \
     "$marker"
 
-  rank=$((rank+1))
-done < "$TMPDIR/sorted"
+  rank=$((rank + 1))
+done < "$SORTED"
 
-best=$(head -n1 "$TMPDIR/sorted")
-best_host=$(echo "$best" | cut -f2)
-best_base=$(echo "$best" | cut -f6)
+BEST_LINE="$(head -n1 "$SORTED")"
+BEST_HOST="$(printf '%s\n' "$BEST_LINE" | cut -f2)"
+BEST_BASE="$(printf '%s\n' "$BEST_LINE" | cut -f8)"
 
-echo
-echo "Best overall:"
-echo "deb $best_base $SUITE main contrib non-free non-free-firmware"
-
-while read -r line; do
-  host=$(echo "$line" | cut -f2)
-  if is_swedish "$host"; then
-    base=$(echo "$line" | cut -f6)
-    echo
-    echo "Best Swedish mirror:"
-    echo "deb $base $SUITE main contrib non-free non-free-firmware"
+BEST_SE_LINE=""
+while IFS= read -r line; do
+  host="$(printf '%s\n' "$line" | cut -f2)"
+  if is_swedish_mirror "$host"; then
+    BEST_SE_LINE="$line"
     break
   fi
-done < "$TMPDIR/sorted"
+done < "$SORTED"
+
+echo
+echo "Recommendation:"
+echo "Best overall:"
+echo "  $BEST_HOST"
+echo "  deb ${BEST_BASE} ${SUITE} main contrib non-free non-free-firmware"
+
+if [[ -n "$BEST_SE_LINE" ]]; then
+  BEST_SE_HOST="$(printf '%s\n' "$BEST_SE_LINE" | cut -f2)"
+  BEST_SE_BASE="$(printf '%s\n' "$BEST_SE_LINE" | cut -f8)"
+  echo
+  echo "Best Swedish mirror:"
+  echo "  $BEST_SE_HOST"
+  echo "  deb ${BEST_SE_BASE} ${SUITE} main contrib non-free non-free-firmware"
+fi
