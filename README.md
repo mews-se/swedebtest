@@ -2,6 +2,7 @@
 
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](http://unlicense.org/)
 [![Bash](https://img.shields.io/badge/language-bash-green.svg)]()
+[![Version](https://img.shields.io/badge/version-v2026.07.31-orange.svg)]()
 
 Simple benchmark tool for Debian mirrors, with focus on Swedish mirrors.
 

@@ -4,6 +4,8 @@ set -euo pipefail
 export LC_ALL=C
 export LANG=C
 
+SCRIPT_VERSION="v2026.07.31"
+
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 SUITE="stable"
 RUNS=3
@@ -34,19 +36,37 @@ Examples:
 EOF
 }
 
+require_value() {
+  if [[ $# -lt 2 || -z "$2" ]]; then
+    echo "Missing value for $1" >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --suite)
-      SUITE="${2:-}"
+      require_value "$@"
+      SUITE="$2"
       shift 2
       ;;
     --arch)
-      ARCH="${2:-}"
+      require_value "$@"
+      ARCH="$2"
       shift 2
       ;;
     --runs)
-      RUNS="${2:-}"
+      require_value "$@"
+      if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "--runs requires a positive integer, got: $2" >&2
+        exit 1
+      fi
+      RUNS="$2"
       shift 2
+      ;;
+    --version)
+      echo "$SCRIPT_VERSION"
+      exit 0
       ;;
     -h|--help)
       usage
@@ -66,7 +86,7 @@ require_cmd() {
   }
 }
 
-for cmd in curl awk sed grep sort timeout mktemp wc head tail cut tr dpkg; do
+for cmd in curl awk sed grep sort timeout mktemp wc head tail cut tr; do
   require_cmd "$cmd"
 done
 
@@ -74,8 +94,8 @@ if ! command -v ping >/dev/null 2>&1; then
   echo "Warning: ping not found, ping tests will be skipped." >&2
 fi
 
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT
 
 is_number() {
   [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]
@@ -139,7 +159,7 @@ median_of_file() {
   fi
 
   local sorted_file count
-  sorted_file="$(mktemp "${TMPDIR}/median.XXXXXX")"
+  sorted_file="$(mktemp "${WORKDIR}/median.XXXXXX")"
 
   grep -E '^[0-9]+([.][0-9]+)?$' "$file" | sort -n > "$sorted_file" || true
   count="$(wc -l < "$sorted_file" | tr -d '[:space:]')"
@@ -168,13 +188,13 @@ pick_scheme() {
   local host="$1"
   local path="$2"
 
-  if curl -L -o /dev/null -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 \
+  if curl -fL -o /dev/null -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 \
     "https://${host}${path}" >/dev/null 2>&1; then
     printf "https"
     return 0
   fi
 
-  if curl -L -o /dev/null -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 \
+  if curl -fL -o /dev/null -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 10 \
     "http://${host}${path}" >/dev/null 2>&1; then
     printf "http"
     return 0
@@ -209,9 +229,9 @@ pick_small_file() {
   local base="$1"
 
   local candidates=(
+    "${base}/dists/${SUITE}/Release"
     "${base}/dists/${SUITE}/main/binary-${ARCH}/Packages.gz"
     "${base}/dists/${SUITE}/main/binary-${ARCH}/Packages.xz"
-    "${base}/dists/${SUITE}/Release"
   )
 
   local url
@@ -337,20 +357,21 @@ score_mirror() {
     }'
 }
 
+# Every mirror in MIRRORS is Swedish except the global entries listed here.
 is_swedish_mirror() {
   case "$1" in
-    ftp.se.debian.org|ftp.acc.umu.se|debian.lth.se|mirrors.glesys.net|mirror.zetup.net|ftpmirror1.infania.net|mirror.braindrainlan.nu|debian.mirror.su.se)
-      return 0
+    deb.debian.org)
+      return 1
       ;;
     *)
-      return 1
+      return 0
       ;;
   esac
 }
 
 measure_mirror() {
   local host="$1"
-  local result_dir="$TMPDIR/$host"
+  local result_dir="$WORKDIR/$host"
   mkdir -p "$result_dir"
 
   local scheme base small_url large_url
@@ -401,12 +422,9 @@ measure_mirror() {
   mtotal="$(median_of_file "$result_dir/total.txt")"
   mspeed="$(median_of_file "$result_dir/speed.txt")"
 
-  local http_small http_large
-  http_small="$(tail -n1 "$result_dir/small_1.txt" | awk -F'\t' '{print $4}')"
-  http_large="$(tail -n1 "$result_dir/large_1.txt" | awk -F'\t' '{print $4}')"
-
   local ok=0
-  if [[ "$http_small" == "200" && "$http_large" == "200" ]]; then
+  if awk -F'\t' '$4 == "200" { found = 1 } END { exit !found }' "$result_dir"/small_*.txt \
+    && awk -F'\t' '$4 == "200" { found = 1 } END { exit !found }' "$result_dir"/large_*.txt; then
     ok=1
   fi
 
@@ -424,7 +442,7 @@ measure_mirror() {
     "$base"
 }
 
-RESULTS="$TMPDIR/results.tsv"
+RESULTS="$WORKDIR/results.tsv"
 : > "$RESULTS"
 
 echo "Testing Debian mirrors for suite=${SUITE}, arch=${ARCH}, runs=${RUNS}..." >&2
@@ -436,7 +454,7 @@ for host in "${MIRRORS[@]}"; do
   measure_mirror "$host" >> "$RESULTS"
 done
 
-SORTED="$TMPDIR/sorted.tsv"
+SORTED="$WORKDIR/sorted.tsv"
 sort -t$'\t' -k1,1nr -k7,7nr -k5,5n "$RESULTS" > "$SORTED"
 
 echo
@@ -447,7 +465,9 @@ printf "%s\n" "-----------------------------------------------------------------
 rank=1
 while IFS=$'\t' read -r score host loss avg ttfb total speed base; do
   marker=""
-  [[ "$rank" -eq 1 ]] && marker=" <<< BEST"
+  if [[ "$rank" -eq 1 ]] && awk -v s="$score" 'BEGIN { exit (s + 0 > 0) ? 0 : 1 }'; then
+    marker=" <<< BEST"
+  fi
 
   printf "%-4s %-6s %-31s %-10s %-10s %-15s%s\n" \
     "$rank" \
@@ -461,18 +481,37 @@ while IFS=$'\t' read -r score host loss avg ttfb total speed base; do
   rank=$((rank + 1))
 done < "$SORTED"
 
-BEST_LINE="$(head -n1 "$SORTED")"
-BEST_HOST="$(printf '%s\n' "$BEST_LINE" | cut -f2)"
-BEST_BASE="$(printf '%s\n' "$BEST_LINE" | cut -f8)"
+score_is_positive() {
+  awk -v s="${1:-0}" 'BEGIN { exit (s + 0 > 0) ? 0 : 1 }'
+}
 
+BEST_LINE=""
 BEST_SE_LINE=""
 while IFS= read -r line; do
-  host="$(printf '%s\n' "$line" | cut -f2)"
-  if is_swedish_mirror "$host"; then
-    BEST_SE_LINE="$line"
-    break
+  score="$(printf '%s\n' "$line" | cut -f1)"
+  score_is_positive "$score" || continue
+
+  if [[ -z "$BEST_LINE" ]]; then
+    BEST_LINE="$line"
   fi
+
+  host="$(printf '%s\n' "$line" | cut -f2)"
+  if [[ -z "$BEST_SE_LINE" ]] && is_swedish_mirror "$host"; then
+    BEST_SE_LINE="$line"
+  fi
+
+  [[ -n "$BEST_LINE" && -n "$BEST_SE_LINE" ]] && break
 done < "$SORTED"
+
+if [[ -z "$BEST_LINE" ]]; then
+  echo
+  echo "No mirror responded successfully - no recommendation." >&2
+  echo "Check the suite name (--suite ${SUITE}) and your network connection." >&2
+  exit 1
+fi
+
+BEST_HOST="$(printf '%s\n' "$BEST_LINE" | cut -f2)"
+BEST_BASE="$(printf '%s\n' "$BEST_LINE" | cut -f8)"
 
 echo
 echo "Recommendation:"
