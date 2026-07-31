@@ -1,6 +1,7 @@
 # swedebtest
 
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](http://unlicense.org/)
+[![ShellCheck](https://github.com/mews-se/swedebtest/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/mews-se/swedebtest/actions/workflows/shellcheck.yml)
 [![Bash](https://img.shields.io/badge/language-bash-green.svg)]()
 [![Version](https://img.shields.io/badge/version-v2026.07.31-orange.svg)]()
 [![Status: Deprecated](https://img.shields.io/badge/status-deprecated-red.svg)]()
