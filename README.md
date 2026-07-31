@@ -3,6 +3,15 @@
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](http://unlicense.org/)
 [![Bash](https://img.shields.io/badge/language-bash-green.svg)]()
 [![Version](https://img.shields.io/badge/version-v2026.07.31-orange.svg)]()
+[![Status: Deprecated](https://img.shields.io/badge/status-deprecated-red.svg)]()
+
+> **⚠️ Deprecated:** This project has been superseded by
+> **[geodebtest](https://github.com/mews-se/geodebtest)** and will be
+> archived. geodebtest does everything swedebtest does, but works in any
+> country: it autodetects your location, fetches the current official
+> Debian mirror list (no hardcoded mirrors that go stale), and can apply
+> the mirror you pick straight to your APT sources. No further updates
+> will be made here.
 
 Simple benchmark tool for Debian mirrors, with focus on Swedish mirrors.
 
